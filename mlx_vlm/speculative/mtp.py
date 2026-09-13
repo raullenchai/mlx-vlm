@@ -8,7 +8,7 @@ from functools import partial
 import mlx.core as mx
 
 from ..models.cache import BatchKVCache, BatchQuantizedKVCache
-from .adaptive import K23AcceptanceGate, K23EvController
+from .adaptive import K23AcceptanceGate, K23CostProfile, K23EvController
 from .cache_state import SpeculativeCache, iter_leaf_caches
 from .sampling import accept_greedy, accept_sampled
 
@@ -77,15 +77,19 @@ def mtp_rounds(
         for processors in logits_processors or []
         for processor in processors or []
     )
-    ev_controller = (
-        K23EvController()
-        if _ev_k23_enabled()
+    ev_controller = None
+    if (
+        _ev_k23_enabled()
         and count == 2
         and batch == 1
         and greedy_sampling
         and not immediate_yield
-        else None
-    )
+    ):
+        cost_profile = getattr(draft_model, "_mtp_k23_cost_profile", None)
+        if cost_profile is None:
+            cost_profile = K23CostProfile()
+            draft_model._mtp_k23_cost_profile = cost_profile
+        ev_controller = K23EvController(cost_profile=cost_profile)
     adaptive = (
         K23AcceptanceGate()
         if ev_controller is None
@@ -206,7 +210,11 @@ def mtp_rounds(
                             produced[row] += 1
                     if pos + 1 == width:
                         state.commit(emitted, forward)
-                        if controller is not None:
+                        has_next_round = any(
+                            not done and n < limit
+                            for done, n, limit in zip(stopped, produced, limits)
+                        )
+                        if controller is not None and has_next_round:
                             # The replay head feeds only the next round.  Start
                             # it before yielding the final token so device work
                             # overlaps the caller's detokenization / framing.

@@ -26,6 +26,13 @@ class _CostEwma:
         self.samples += 1
 
 
+class K23CostProfile:
+    """Hardware/model cost state that can be reused across requests."""
+
+    def __init__(self):
+        self.by_depth = {1: _CostEwma(), 2: _CostEwma()}
+
+
 class K23EvController:
     """Pick one or two MTP drafts from measured tokens-per-compute-time.
 
@@ -40,18 +47,24 @@ class K23EvController:
         *,
         seed_samples: int = 4,
         acceptance_alpha: float = 0.1,
+        acceptance_min_samples: int = 12,
         probe_interval: int = 64,
+        cost_profile: K23CostProfile | None = None,
     ):
         if seed_samples < 1:
             raise ValueError("seed_samples must be positive")
         if not 0.0 < acceptance_alpha <= 1.0:
             raise ValueError("acceptance_alpha must be in (0, 1]")
+        if acceptance_min_samples < 1:
+            raise ValueError("acceptance_min_samples must be positive")
         if probe_interval < 1:
             raise ValueError("probe_interval must be positive")
         self.seed_samples = seed_samples
         self.acceptance_alpha = acceptance_alpha
+        self.acceptance_min_samples = acceptance_min_samples
         self.probe_interval = probe_interval
-        self.cost = {1: _CostEwma(), 2: _CostEwma()}
+        self.cost_profile = cost_profile or K23CostProfile()
+        self.cost = self.cost_profile.by_depth
         self.rate = {1: 1.0, 2: 1.0}
         self.seen = {1: 0, 2: 0}
         self.rounds = 0
@@ -61,12 +74,17 @@ class K23EvController:
     def _selected(self) -> int:
         if any(self.cost[depth].samples < self.seed_samples for depth in (1, 2)):
             return 1
-        p1 = self.rate[1]
+        p1 = self._trusted_rate(1)
         expected = {
             1: 1.0 + p1,
-            2: 1.0 + p1 + p1 * self.rate[2],
+            2: 1.0 + p1 + p1 * self._trusted_rate(2),
         }
         return max((1, 2), key=lambda depth: expected[depth] / self.cost[depth].value)
+
+    def _trusted_rate(self, position: int) -> float:
+        if self.seen[position] < self.acceptance_min_samples:
+            return 1.0
+        return self.rate[position]
 
     def pick(self) -> int:
         for depth in (1, 2):
