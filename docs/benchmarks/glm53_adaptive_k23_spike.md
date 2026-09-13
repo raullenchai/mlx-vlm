@@ -1,0 +1,82 @@
+# GLM-5.3 cache-owned adaptive K2/K3 spike
+
+Date: 2026-09-13
+
+This is a scoped research result, not a default runtime policy.  It tests
+whether a request-local acceptance window can retain the second native-MTP
+draft token on profitable content while falling back to one draft token when
+acceptance decays.
+
+## Configuration
+
+- Apple M3 Ultra, 256 GiB, macOS 26.5.2
+- target: `Vontra/GLM-5.3-Flash-MLX-4bit-MTP`, revision
+  `76add2a341a1cd90ad0e86bb69839ea9c35827c6`
+- target-matched Q4 MTP sidecar: 3.9 GiB
+- temperature zero, batch one, per-task thinking budgets
+- six tasks: coding, closed-book knowledge, multi-step math, exact instruction
+  following, constrained creative writing, and long-context retrieval
+- source base: cache-owned MTP merge plus strict Q4 `lm_head` remap at
+  `ddea4644`
+
+The candidate starts with two draft tokens.  After at least 12 complete
+two-draft rounds, it falls back to one draft token if a rolling 64-round
+window accepts less than 65% of proposed drafts.  It never promotes again in
+the same request.  The gate is enabled only for singleton greedy decode with
+`MLX_VLM_MTP_ADAPTIVE_K23=1` and block-total 3.
+
+## Result
+
+All fixed-width and adaptive runs passed 6/6 tasks.  Complete reasoning and
+final responses were byte-identical across widths and across both adaptive
+runs.
+
+| Mode | Coding | Knowledge | Math | Instruction | Creative | Long context | Category median |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| fixed block-total 2 | 36.17 | 34.34 | 32.63 | 33.42 | 33.23 | 11.62 | 33.33 |
+| fixed block-total 3 | 37.14 | 37.25 | 33.51 | 35.88 | 31.74 | 11.95 | 34.69 |
+| adaptive run 1 | 36.97 | 37.20 | 33.24 | 35.86 | 32.57 | 11.98 | 34.55 |
+| adaptive run 2 | 36.98 | 37.24 | 33.31 | 35.92 | 32.50 | 11.98 | 34.61 |
+
+Relative to fixed block-total 2, adaptive run 1 improved the paired six-task
+median by 1.027x.  Five categories improved; creative retained 0.980x.  Against
+fixed block-total 3, adaptive improved creative by 1.026x while the other five
+categories stayed within 0.9%.  The two adaptive runs reproduced within
+0.23% on every category.
+
+Fixed block-total-3 acceptance was 81.4%, 88.6%, 72.8%, 93.0%, 60.9%, and
+94.8% in table order.  The adaptive gate therefore retained two drafts for
+every category except creative writing.  Creative used 66 two-draft rounds,
+then completed with one draft; both adaptive runs made the identical choice
+and reported 202 total rounds, 268 proposed drafts, and 186 accepted drafts.
+
+The host had unrelated `mediaanalysisd`, `fseventsd`, and pytest load during
+the campaign.  Absolute throughput should be repeated on an idle host before
+a release claim; the exact output, acceptance counts, adaptive choice, and
+near-identical adaptive repeats were stable despite that load.
+
+## Reproduction
+
+Start the server from this branch with the already-local target and sidecar:
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \
+MLX_VLM_MTP_ADAPTIVE_K23=1 \
+python -m mlx_vlm.server \
+  --model /path/to/target-snapshot \
+  --draft-model /path/to/q4-mtp-sidecar \
+  --draft-kind mtp --draft-block-size 3 \
+  --host 127.0.0.1 --port 8465 --max-tokens 1024 --enable-thinking
+```
+
+Run the Rapid-MLX `scripts/benchmark_glm53_real_tasks.py` six-task gate and
+compare its artifact to a fixed block-total-2 control from the same source.
+
+## Promotion gate
+
+Do not upstream the current environment-gated policy as a generic default.
+The 65% crossover is qualified only for this Q4 GLM target and sidecar, the
+policy is singleton-greedy only, and it has no recovery probe after falling
+back.  A production controller should learn the per-depth cost curve, export
+its selected-depth telemetry, and be tested under batched scheduling before
+replacing the explicit block-size control.
