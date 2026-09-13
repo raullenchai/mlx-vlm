@@ -1,8 +1,10 @@
 """Locate the first GLM-5.3 layer that differs between B=1 and B=N.
 
 This is an offline diagnostic for Blaizzy/mlx-vlm#2242.  It intentionally
-uses a short, identical prompt in every row and no cache, separating backbone
-batch-shape numerics from scheduler admission and speculative rollback.
+uses a short, identical prompt in every row.  By default it runs without a
+cache; ``--cached-decode`` first prefills one row, merges exact copies of that
+state, then compares the next T=1 step.  The latter isolates decode batch-shape
+arithmetic from both prefill drift and scheduler admission.
 """
 
 from __future__ import annotations
@@ -292,6 +294,7 @@ def diagnose(
     force_rowwise_multilinear: bool = False,
     force_rowwise_sdpa: bool = False,
     force_rowwise_conv: bool = False,
+    cached_decode: bool = False,
 ) -> dict:
     if disable_singleton_hc:
         # B=1/T>1 normally takes exact_hc_normalized_norm while B>1 takes the
@@ -306,29 +309,29 @@ def diagnose(
         original_linear = glm_language.linear
         original_tiled_linear = glm_language.tiled_linear
 
-        def stable_linear(module, value):
+        def stable_linear(module, value, base_linear=original_linear):
             if value.ndim == 3 and value.shape[0] > 1:
                 return mx.concatenate(
                     [
-                        original_linear(module, value[row : row + 1])
+                        base_linear(module, value[row : row + 1])
                         for row in range(value.shape[0])
                     ],
                     axis=0,
                 )
-            return original_linear(module, value)
+            return base_linear(module, value)
 
         glm_language.linear = stable_linear
 
-        def stable_tiled_linear(module, value):
+        def stable_tiled_linear(module, value, base_tiled=original_tiled_linear):
             if value.ndim == 3 and value.shape[0] > 1 and value.shape[1] <= 8:
                 return mx.concatenate(
                     [
-                        original_tiled_linear(module, value[row : row + 1])
+                        base_tiled(module, value[row : row + 1])
                         for row in range(value.shape[0])
                     ],
                     axis=0,
                 )
-            return original_tiled_linear(module, value)
+            return base_tiled(module, value)
 
         glm_language.tiled_linear = stable_tiled_linear
     if force_singleton_hc_mix:
@@ -372,7 +375,7 @@ def diagnose(
         original_sdpa = glm_language.scaled_dot_product_attention
 
         def stable_sdpa(queries, keys, values, cache, scale, mask, sinks=None):
-            if queries.shape[0] > 1 and cache is None:
+            if queries.shape[0] > 1:
                 return mx.concatenate(
                     [
                         original_sdpa(
@@ -416,7 +419,32 @@ def diagnose(
     model, processor = load(model_path)
     language = getattr(model, "language_model", model)
     backbone = language.model
+    layers = backbone.layers[:max_layers]
     single_tokens = _tokens(processor, prompt, length)
+    single_cache = batch_cache = None
+    if cached_decode:
+        from mlx_vlm.models.base import create_ssm_mask
+
+        single_cache = language.make_cache()[: len(layers)]
+        prefill_hidden = backbone.embed_tokens(single_tokens)
+        prefill_hidden = mx.repeat(
+            prefill_hidden[:, :, None], backbone.config.hc_mult, axis=2
+        )
+        prefill_mask = mx.ones(single_tokens.shape, dtype=mx.bool_)
+        prefill_topk = None
+        for layer, layer_cache in zip(layers, single_cache):
+            layer_mask = prefill_mask
+            if layer.is_linear:
+                layer_mask = create_ssm_mask(prefill_hidden[:, :, 0], layer_cache)
+            prefill_hidden, prefill_topk = layer(
+                prefill_hidden, layer_mask, layer_cache, prefill_topk
+            )
+            mx.eval(prefill_hidden)
+            if prefill_topk is not None:
+                mx.eval(prefill_topk)
+        batch_cache = [entry.merge([entry] * batch_size) for entry in single_cache]
+        next_token = single_tokens[:, -1:]
+        single_tokens = next_token
     batch_tokens = mx.repeat(single_tokens, batch_size, axis=0)
 
     single = backbone.embed_tokens(single_tokens)
@@ -433,10 +461,9 @@ def diagnose(
     rows.append({"site": "embedding", "exact": exact, "max_abs": maximum})
     detail = (
         _first_layer_detail(backbone, single, batched, single_mask, batch_mask)
-        if detail_first_layer
+        if detail_first_layer and not cached_decode
         else []
     )
-    layers = backbone.layers[:max_layers]
     for index, layer in enumerate(layers):
         if detail_layer == index:
             detail.extend(
@@ -451,8 +478,21 @@ def diagnose(
                     batch_topk,
                 )
             )
-        single, single_topk = layer(single, single_mask, None, single_topk)
-        batched, batch_topk = layer(batched, batch_mask, None, batch_topk)
+        single_layer_cache = None if single_cache is None else single_cache[index]
+        batch_layer_cache = None if batch_cache is None else batch_cache[index]
+        single_layer_mask = single_mask
+        batch_layer_mask = batch_mask
+        if layer.is_linear and single_layer_cache is not None:
+            from mlx_vlm.models.base import create_ssm_mask
+
+            single_layer_mask = create_ssm_mask(single[:, :, 0], single_layer_cache)
+            batch_layer_mask = create_ssm_mask(batched[:, :, 0], batch_layer_cache)
+        single, single_topk = layer(
+            single, single_layer_mask, single_layer_cache, single_topk
+        )
+        batched, batch_topk = layer(
+            batched, batch_layer_mask, batch_layer_cache, batch_topk
+        )
         exact, maximum = _delta(single, batched)
         topk_exact = None
         if single_topk is not None and batch_topk is not None:
@@ -479,8 +519,10 @@ def diagnose(
             if language.args.tie_word_embeddings
             else language.lm_head
         )
-        single_logits = linear(head, single[:, -1:])
-        batch_logits = linear(head, batched[:, -1:])
+        from mlx_vlm.models.glm5_next import language as glm_language
+
+        single_logits = glm_language.linear(head, single[:, -1:])
+        batch_logits = glm_language.linear(head, batched[:, -1:])
         exact, maximum = _delta(single_logits, batch_logits)
         single_token = int(mx.argmax(single_logits[0, -1]).item())
         batch_token = int(mx.argmax(batch_logits[0, -1]).item())
@@ -506,6 +548,7 @@ def diagnose(
         "force_rowwise_multilinear": force_rowwise_multilinear,
         "force_rowwise_sdpa": force_rowwise_sdpa,
         "force_rowwise_conv": force_rowwise_conv,
+        "cached_decode": cached_decode,
         "detail": detail,
         "rows": rows,
     }
@@ -529,6 +572,7 @@ def main() -> None:
     parser.add_argument("--force-rowwise-multilinear", action="store_true")
     parser.add_argument("--force-rowwise-sdpa", action="store_true")
     parser.add_argument("--force-rowwise-conv", action="store_true")
+    parser.add_argument("--cached-decode", action="store_true")
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     result = diagnose(
@@ -545,6 +589,7 @@ def main() -> None:
         force_rowwise_multilinear=args.force_rowwise_multilinear,
         force_rowwise_sdpa=args.force_rowwise_sdpa,
         force_rowwise_conv=args.force_rowwise_conv,
+        cached_decode=args.cached_decode,
     )
     rendered = json.dumps(result, indent=2, sort_keys=True)
     if args.output is not None:

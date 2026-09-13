@@ -150,6 +150,46 @@ by the dynamic-admission server repro and an aggregate-throughput gate.  Do
 not trade away the measured 1.66x four-request scaling merely to obtain exact
 bytes.
 
+### Parallel decode qualification
+
+The row-loop oracle was replaced with parallel Metal kernels for affine-Q4
+linear and per-head `MultiLinear` projections.  Short-block hyperconnection
+normalization now uses the existing fixed-row fused kernel for every batch
+size, and sparse decode reads selected positions directly from the physical KV
+cache while respecting its logical length.  No Python row loop remains in the
+candidate path.
+
+With a B=1 cache prefetched once and copied exactly to B=4, stock T=1 decode
+first differed at layer 0 (`max_abs=0.000213623046875`) and reached
+`0.00390625` by the first sparse-attention layer.  The parallel candidate was
+bit-exact at every one of 45 layers, every sparse top-k result, the final norm,
+and all 154,880 logits (`max_abs=0`, identical argmax token 43799).  This test
+isolates decode arithmetic from prefill and scheduler admission.
+
+Target-shape microbenchmarks on the same M3 Ultra showed:
+
+- affine-Q4 `MultiLinear` (B=4): 0.290 ms native, 0.259 ms parallel, 0.308 ms
+  row loop;
+- sparse attention over an 8,192-token latent cache with 2,048 selected
+  positions: 1.060 ms for gather plus SDPA versus 0.726 ms direct indexed
+  attention.
+
+End-to-end effects are smaller because these operators are only part of a
+decode step.  On a 62-token arithmetic prompt with 128 generated tokens, warm
+singleton latency improved from 3.99 s to 3.87 s (3.1%).  Four-request
+aggregate throughput was neutral: 53.63 versus 53.39 tok/s.  On a
+14,476-token prompt, output was byte-identical and decode was 38.2 versus 38.4
+tok/s, within run noise.  Do not claim the operator microbenchmark speedups as
+whole-model gains.
+
+The server still does not promise singleton-versus-batched-prefill byte
+identity: prompts longer than the short-block limit use native prefill
+reductions.  Coalesced rows remained mutually identical, and coding,
+knowledge, and constrained creative-writing dogfood all produced correct final
+answers when run with a 128-token thinking budget.  Treat this candidate as a
+decode determinism improvement with no measured concurrency regression, not a
+complete resolution of dynamic-admission determinism.
+
 ## Rejected: shared cross-request cost EWMA
 
 A follow-up reused the K1/K2 wall-time EWMA across requests while keeping
