@@ -55,6 +55,29 @@ the campaign.  Absolute throughput should be repeated on an idle host before
 a release claim; the exact output, acceptance counts, adaptive choice, and
 near-identical adaptive repeats were stable despite that load.
 
+## Replay-overlap follow-up
+
+Launching the replay-head seed with `mx.async_eval` immediately before the
+verified block's final yield raised the adaptive path again without changing
+its decisions:
+
+| Mode | Coding | Knowledge | Math | Instruction | Creative | Long context |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| adaptive + async run 1 | 37.63 | 37.69 | 33.88 | 36.52 | 33.05 | 12.02 |
+| adaptive + async run 2 | 37.67 | 37.56 | 33.73 | 36.45 | 32.98 | 12.03 |
+
+Against the original adaptive run, the first repeat improved the paired
+six-task median 1.016x and every task was at least 1.003x.  Against the
+same-source non-speculative AR artifact, the two repeats improved the paired
+median 1.322x and 1.320x.  Both remained 6/6 and byte-identical.  Their
+per-task round/proposal/accept counters were also exactly identical to the
+original adaptive run, showing that the gain came from scheduling rather than
+a changed K decision or output trajectory.
+
+The replay launch is isolated for review on
+`perf/glm53-async-mtp-replay`; unlike this adaptive policy, it has no tuned
+acceptance threshold.
+
 ## Reproduction
 
 Start the server from this branch with the already-local target and sidecar:
