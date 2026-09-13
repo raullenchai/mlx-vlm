@@ -1,12 +1,25 @@
 """MTP proposal / target verification / prefix acceptance / cache commit."""
 
+import logging
+import os
 from functools import partial
 
 import mlx.core as mx
 
 from ..models.cache import BatchKVCache, BatchQuantizedKVCache
+from .adaptive import K23AcceptanceGate
 from .cache_state import SpeculativeCache, iter_leaf_caches
 from .sampling import accept_greedy, accept_sampled
+
+logger = logging.getLogger(__name__)
+
+
+def _adaptive_k23_enabled():
+    return os.environ.get("MLX_VLM_MTP_ADAPTIVE_K23", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 def mtp_rounds(
@@ -55,6 +68,15 @@ def mtp_rounds(
         for processors in logits_processors or []
         for processor in processors or []
     )
+    adaptive = (
+        K23AcceptanceGate()
+        if _adaptive_k23_enabled()
+        and count == 2
+        and batch == 1
+        and greedy_sampling
+        and not immediate_yield
+        else None
+    )
     target = getattr(model, "language_model", model)
     row_ids = list(range(batch)) if row_ids is None else row_ids
     padding = None
@@ -99,7 +121,11 @@ def mtp_rounds(
                 0 if stopped[i] else max(0, limits[i] - n)
                 for i, n in enumerate(produced)
             ]
-            depth = 0 if immediate_yield else min(count, max(budgets) - 1)
+            available_depth = min(count, max(budgets) - 1)
+            depth = 0 if immediate_yield else available_depth
+            if adaptive is not None:
+                depth = min(adaptive.pick(), available_depth)
+            stats_before = state.stats[0].snapshot() if adaptive is not None else None
             proposals = state.propose(depth, forward)
             if phase_observer:
                 phase_observer("draft", [proposals])
@@ -152,6 +178,13 @@ def mtp_rounds(
                             produced[row] += 1
                     if pos + 1 == width:
                         state.commit(emitted, forward)
+                        if adaptive is not None and stats_before is not None:
+                            stats_after = state.stats[0].snapshot()
+                            adaptive.record(
+                                depth=depth,
+                                accepted=stats_after[1] - stats_before[1],
+                                drafted=stats_after[2] - stats_before[2],
+                            )
                         if phase_observer:
                             phase_observer(
                                 "commit", [state.seed.token, state.seed.hidden]
@@ -178,3 +211,5 @@ def mtp_rounds(
                     state.commit(emitted, forward)
     finally:
         state.abort()
+        if adaptive is not None:
+            logger.info("MTP adaptive K2/K3: %s", adaptive.summary())

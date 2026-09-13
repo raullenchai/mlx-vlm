@@ -15,6 +15,7 @@ from mlx_vlm.speculative.cache_state import (
     SpeculativePrefill,
     iter_leaf_caches,
 )
+from mlx_vlm.speculative.adaptive import K23AcceptanceGate
 from mlx_vlm.speculative.drafters.glm5_next_mtp import Glm5NextMTPDraftModel
 from mlx_vlm.speculative.drafters.glm5_next_mtp import ModelConfig as Glm5NextMTPConfig
 from mlx_vlm.speculative.drafters.glm5_next_mtp.split import split_glm5_next_mtp
@@ -406,6 +407,40 @@ def test_mtp_statistics_are_per_request_and_count_partial_rounds():
     second.record([1, 2], [1, 2, 3])
     assert second.snapshot() == (1, 2, 2)
     assert first.snapshot() == (1, 1, 3)
+
+
+def test_k23_acceptance_gate_keeps_high_acceptance_second_draft():
+    gate = K23AcceptanceGate(sample_rounds=4, min_acceptance=0.68)
+    for accepted in (2, 1, 2, 1):
+        assert gate.pick() == 2
+        gate.record(depth=2, accepted=accepted, drafted=2)
+    assert gate.pick() == 2
+    assert gate.acceptance == pytest.approx(0.75)
+
+
+def test_k23_acceptance_gate_falls_back_and_ignores_partial_rounds():
+    gate = K23AcceptanceGate(sample_rounds=3, min_acceptance=0.68)
+    gate.record(depth=1, accepted=1, drafted=1)
+    gate.record(depth=2, accepted=1, drafted=1)
+    assert gate.rounds == 0
+    for accepted in (1, 1, 2):
+        gate.record(depth=2, accepted=accepted, drafted=2)
+    assert gate.pick() == 1
+    assert gate.acceptance == pytest.approx(4 / 6)
+
+
+def test_k23_acceptance_gate_detects_acceptance_that_falls_late():
+    gate = K23AcceptanceGate(
+        sample_rounds=4, min_acceptance=0.68, window_rounds=8
+    )
+    for _ in range(4):
+        gate.record(depth=2, accepted=2, drafted=2)
+    assert gate.pick() == 2
+    for _ in range(4):
+        gate.record(depth=2, accepted=0, drafted=2)
+    assert gate.pick() == 1
+    assert gate.rounds == 6
+    assert gate.acceptance == pytest.approx(2 / 3)
 
 
 def _tiny_glm5_next_text_config():
