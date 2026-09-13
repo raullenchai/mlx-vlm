@@ -15,11 +15,7 @@ from mlx_vlm.speculative.cache_state import (
     SpeculativePrefill,
     iter_leaf_caches,
 )
-from mlx_vlm.speculative.adaptive import (
-    K23AcceptanceGate,
-    K23CostProfile,
-    K23EvController,
-)
+from mlx_vlm.speculative.adaptive import K23AcceptanceGate, K23EvController
 from mlx_vlm.speculative.drafters.glm5_next_mtp import Glm5NextMTPDraftModel
 from mlx_vlm.speculative.drafters.glm5_next_mtp import ModelConfig as Glm5NextMTPConfig
 from mlx_vlm.speculative.drafters.glm5_next_mtp.split import split_glm5_next_mtp
@@ -448,12 +444,8 @@ def test_k23_acceptance_gate_detects_acceptance_that_falls_late():
 
 
 def test_k23_ev_controller_selects_depth_from_cost_and_conditional_acceptance():
-    fast_second = K23EvController(
-        seed_samples=2, acceptance_alpha=1.0, acceptance_min_samples=1
-    )
-    slow_second = K23EvController(
-        seed_samples=2, acceptance_alpha=1.0, acceptance_min_samples=1
-    )
+    fast_second = K23EvController(seed_samples=2, acceptance_alpha=1.0)
+    slow_second = K23EvController(seed_samples=2, acceptance_alpha=1.0)
     for controller, second_accepted in (
         (fast_second, 2),
         (slow_second, 1),
@@ -483,26 +475,11 @@ def test_k23_ev_controller_seeds_both_widths_before_comparing():
 
 def test_k23_ev_controller_periodically_probes_other_width():
     controller = K23EvController(
-        seed_samples=1,
-        acceptance_alpha=1.0,
-        acceptance_min_samples=1,
-        probe_interval=3,
+        seed_samples=1, acceptance_alpha=1.0, probe_interval=3
     )
     controller.record(depth=1, accepted=1, drafted=1, wall_ms=10.0)
     controller.record(depth=2, accepted=2, drafted=2, wall_ms=12.0)
     assert [controller.pick() for _ in range(3)] == [2, 2, 1]
-
-
-def test_k23_ev_controller_reuses_cost_profile_but_not_acceptance():
-    profile = K23CostProfile()
-    first = K23EvController(seed_samples=1, cost_profile=profile)
-    first.record(depth=1, accepted=1, drafted=1, wall_ms=10.0)
-    first.record(depth=2, accepted=0, drafted=2, wall_ms=12.0)
-
-    second = K23EvController(seed_samples=1, cost_profile=profile)
-    assert second.cost[1].samples == second.cost[2].samples == 1
-    assert second.seen == {1: 0, 2: 0}
-    assert second.pick() == 2
 
 
 def test_k23_ev_controller_generation_path_matches_ar(monkeypatch, caplog):
