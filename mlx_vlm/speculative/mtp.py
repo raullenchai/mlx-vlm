@@ -178,7 +178,7 @@ def mtp_rounds(
                     greedy=greedy_sampling,
                     compute_logprobs=compute_logprobs,
                 )
-            pre_commit_ms = (
+            round_compute_ms = (
                 (time.perf_counter() - compute_started) * 1000.0
                 if compute_started is not None
                 else 0.0
@@ -205,20 +205,7 @@ def mtp_rounds(
                             emitted[row].append(token)
                             produced[row] += 1
                     if pos + 1 == width:
-                        commit_started = (
-                            time.perf_counter() if ev_controller is not None else None
-                        )
                         state.commit(emitted, forward)
-                        if ev_controller is not None:
-                            # Materialize the replay head here so its device cost
-                            # is charged to this round, not whichever depth the
-                            # next round happens to select.  Caller time between
-                            # streamed yields is intentionally excluded.
-                            mx.eval(
-                                state.seed.token,
-                                state.seed.hidden,
-                                state.bonus,
-                            )
                         if controller is not None and stats_before is not None:
                             stats_after = state.stats[0].snapshot()
                             record_args = {
@@ -226,10 +213,14 @@ def mtp_rounds(
                                 "accepted": stats_after[1] - stats_before[1],
                                 "drafted": stats_after[2] - stats_before[2],
                             }
-                            if ev_controller is not None and commit_started is not None:
-                                record_args["wall_ms"] = pre_commit_ms + (
-                                    time.perf_counter() - commit_started
-                                ) * 1000.0
+                            if ev_controller is not None:
+                                # Acceptance has synchronized this round's
+                                # proposal + target verification.  Do not force
+                                # the replay head here: doing so changes the
+                                # pipeline being measured.  Any lazy replay work
+                                # that remains is naturally paid at the next
+                                # round's proposal boundary.
+                                record_args["wall_ms"] = round_compute_ms
                             controller.record(**record_args)
                         if phase_observer:
                             phase_observer(
