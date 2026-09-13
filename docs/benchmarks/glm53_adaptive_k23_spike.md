@@ -125,6 +125,31 @@ AR aggregate throughput from 57.95 to 50.07 tok/s (13.6%).  The remaining
 sources include GLM recurrent, MoE, and batch-state-transition paths; do not
 ship a global singleton-QMM fallback.
 
+### Layer-local batch-invariance diagnosis
+
+A follow-up offline probe compared the same eight-token prompt at B=1 and B=4
+after every GLM layer.  Stock execution was exact through the embedding, first
+diverged at linear-attention layer 0 (`max_abs=0.00054931640625`), and reached
+`max_abs=9.625` at layer 44 and `2.25` at the logits.  Sparse-index top-k sets
+remained exact at every attention layer, excluding index selection and MoE
+routing as the initial cause.
+
+Three short-block reduction geometries explain the complete difference:
+
+- quantized and narrow dense projections execute with a different B>1
+  reduction than independent B=1 rows;
+- hyperconnection `_mix` uses tokenwise B=1 matmul but batched B>1 matmul;
+- fused SDPA changes its reduction geometry with batch size.
+
+A correctness oracle that independently reused the B=1 operation for each row
+at those three sites produced bit-exact output at all 45 layers, the final
+norm, and the complete logits (`max_abs=0` throughout).  This proves the P1 is
+locally repairable, but the row loop is not a production implementation.  The
+next step is a parallel kernel with the same per-row reduction order, followed
+by the dynamic-admission server repro and an aggregate-throughput gate.  Do
+not trade away the measured 1.66x four-request scaling merely to obtain exact
+bytes.
+
 ## Rejected: shared cross-request cost EWMA
 
 A follow-up reused the K1/K2 wall-time EWMA across requests while keeping
