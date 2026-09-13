@@ -109,6 +109,18 @@ Those inputs differ even when every proposed token matches.  Keep the current
 abort-and-replay behavior unless a future MTP architecture explicitly proves
 that its proposal and committed hidden-state paths are identical.
 
+## Rejected: fused quantized argmax for the draft head
+
+The MTP head only consumes the winning token, so avoiding a materialized vocab
+projection appeared promising.  A direct microbenchmark used the cached
+target's real affine-Q4 `lm_head` geometry (4096 inputs, 154,880 outputs,
+group size 64, BF16 input) and compared the current `linear` plus `argmax`
+path with the optimized affine quantized-argmax kernel.  Across three 100-call
+runs, current-path medians were 0.672-0.677 ms while fused-argmax medians were
+0.701-0.705 ms.  Tokens matched exactly, but the candidate was 3.5-4.4%
+slower.  Do not add a GLM-specific draft-head path for this kernel on the
+current MLX/runtime combination.
+
 ## Reproduction
 
 Start the server from this branch with the already-local target and sidecar:
