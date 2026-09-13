@@ -276,6 +276,30 @@ difference was `5.39e-4`.  The old headline therefore does not transfer to the
 current runtime, and its 1,100+ lines should not be revived.  Multi-token
 target verification remains the relevant KDA/MoE surface.
 
+## In progress: triplet MoE weight reuse
+
+A real T=2 verifier ablation measured 40.57 ms for the target, 23.00 ms with
+the 42 sparse MoE branches replaced by zero branches, and 21.94 ms with all
+FFNs replaced.  Sparse MoE is therefore about 17.57 ms (43.3%) of this target
+step.  Across the 42 real Q4 MoE layers at T=2, isolated medians were 10.76 ms
+for gate/up, 5.08 ms for routed down plus the fused epilogue, 3.03 ms for
+routing, 2.03 ms for the shared expert, and 0.43 ms for activation.
+
+Real coding-prompt routes shared a mean 3.67 of eight experts between two
+adjacent verifier positions.  At T=3, the third position shared a mean 3.93
+experts with the union of the first two.  The existing affine gate/up kernel
+only paired positions zero and one.  A lossless greedy extension also pairs
+non-three-way 0/2 and 1/2 matches while retaining the established two-input
+register geometry.  On 42 real Q4 layers with a reproducible four-of-eight
+overlap pattern, T=3 gate/up improved from 14.162 to 13.495 ms (4.7%, 0.667
+ms), with T=2/3/4 outputs bit-exact against independent selected projections.
+
+This is not yet a product claim or PR.  A first full target+draft E2E attempt
+was terminated by host memory pressure while an unrelated local model server
+was resident and swap was nearly full.  Repeat K=3 generation on an idle host;
+keep the change only if the whole-model gain clears run noise, or combine it
+with an exact routed-down reuse path before promotion.
+
 ## Reproduction
 
 Start the server from this branch with the already-local target and sidecar:

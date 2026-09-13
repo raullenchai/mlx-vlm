@@ -482,6 +482,39 @@ def test_fused_fp8_gate_up_matches_native_selected_projections(
     assert all(mx.array_equal(a, b).item() for a, b in zip(actual, expected))
 
 
+@pytest.mark.skipif(not mx.metal.is_available(), reason="requires Metal")
+@pytest.mark.parametrize("length", [2, 3, 4])
+def test_fused_affine_gate_up_reuses_experts_without_changing_results(length):
+    from mlx_vlm.models.quantized_verifier import exact_quantized_switch_gate_up
+
+    mx.random.seed(530 + length)
+    switch = SwitchGLU(512, 256, 8)
+    switch.up_proj = _bf16_quantization_parameters(
+        switch.up_proj.to_quantized(64, 4, "affine")
+    )
+    switch.gate_proj = _bf16_quantization_parameters(
+        switch.gate_proj.to_quantized(64, 4, "affine")
+    )
+    x = mx.random.normal((1, length, 512)).astype(mx.bfloat16)
+    routes = mx.array(
+        [
+            [0, 1, 2, 3],
+            [0, 4, 2, 5],
+            [0, 4, 6, 3],
+            [7, 1, 6, 5],
+        ][:length],
+        dtype=mx.int32,
+    )[None]
+    actual = exact_quantized_switch_gate_up(switch, x, routes)
+    expected = tuple(
+        exact_quantized_switch_linear(linear, x, routes)
+        for linear in (switch.up_proj, switch.gate_proj)
+    )
+    assert actual is not None
+    mx.eval(actual, expected)
+    assert all(mx.array_equal(a, b).item() for a, b in zip(actual, expected))
+
+
 def test_fp8_gate_up_preserves_fallbacks_for_other_shapes_and_formats():
     from mlx_vlm.models.quantized_verifier import exact_quantized_switch_gate_up
 

@@ -527,24 +527,73 @@ int batch = token / VERIFY_T;
 int time = token - batch * VERIFY_T;
 int batch_route = batch * VERIFY_T * TOP_K;
 int expert = int(indices[route]);
-int paired_route = -1;
-if ((time & 1) == 0 && time + 1 < VERIFY_T) {
-  int next_route = batch_route + (time + 1) * TOP_K;
-  for (int other = 0; other < TOP_K; ++other) {
-    if (int(indices[next_route + other]) == expert) {
-      paired_route = next_route + other;
-      break;
+constexpr int MAX_PAIR = 2;
+int paired_routes[MAX_PAIR];
+paired_routes[0] = int(route);
+int pair_count = 1;
+if (VERIFY_T == 3) {
+  // Greedily match equal experts across the triplet while retaining the
+  // two-input register geometry.  A three-way match remains (0, 1) plus an
+  // independent token 2; otherwise token 2 can reuse either earlier token.
+  bool at0 = false;
+  bool at1 = false;
+  if (time > 0) {
+    int route0 = batch_route;
+    for (int other = 0; other < TOP_K; ++other) {
+      at0 |= int(indices[route0 + other]) == expert;
     }
   }
-} else if ((time & 1) != 0) {
-  int previous_route = batch_route + (time - 1) * TOP_K;
-  for (int other = 0; other < TOP_K; ++other) {
-    if (int(indices[previous_route + other]) == expert) {
-      return;
+  if (time > 1) {
+    int route1 = batch_route + TOP_K;
+    for (int other = 0; other < TOP_K; ++other) {
+      at1 |= int(indices[route1 + other]) == expert;
     }
   }
+  if (time == 1 && at0) return;
+  if (time == 2 && ((at0 && !at1) || (!at0 && at1))) return;
+
+  int search_time = -1;
+  if (time == 0) {
+    int route1 = batch_route + TOP_K;
+    for (int other = 0; other < TOP_K; ++other) {
+      if (int(indices[route1 + other]) == expert) {
+        paired_routes[pair_count++] = route1 + other;
+        break;
+      }
+    }
+    if (pair_count == 1) search_time = 2;
+  } else if (time == 1 && !at0) {
+    search_time = 2;
+  }
+  if (search_time >= 0) {
+    int later_route = batch_route + search_time * TOP_K;
+    for (int other = 0; other < TOP_K; ++other) {
+      if (int(indices[later_route + other]) == expert) {
+        paired_routes[pair_count++] = later_route + other;
+        break;
+      }
+    }
+  }
+} else {
+  int paired_route = -1;
+  if ((time & 1) == 0 && time + 1 < VERIFY_T) {
+    int next_route = batch_route + (time + 1) * TOP_K;
+    for (int other = 0; other < TOP_K; ++other) {
+      if (int(indices[next_route + other]) == expert) {
+        paired_route = next_route + other;
+        break;
+      }
+    }
+  } else if ((time & 1) != 0) {
+    int previous_route = batch_route + (time - 1) * TOP_K;
+    for (int other = 0; other < TOP_K; ++other) {
+      if (int(indices[previous_route + other]) == expert) {
+        return;
+      }
+    }
+  }
+  if (paired_route >= 0) paired_routes[pair_count++] = paired_route;
 }
-int pair_count = paired_route >= 0 ? 2 : 1;
 constexpr int W_ROW_BYTES = K_SIZE * 5 / 8;
 constexpr int W_EXPERT_BYTES = N_SIZE * W_ROW_BYTES;
 constexpr int GROUPS = K_SIZE / GROUP_SIZE;
@@ -564,15 +613,16 @@ const device T* gate_sc = gate_scales + expert * S_EXPERT_SIZE +
     out_row * GROUPS + int(simd_lid) / SCALE_STEP_PER_THREAD;
 const device T* gate_bs = gate_biases + expert * S_EXPERT_SIZE +
     out_row * GROUPS + int(simd_lid) / SCALE_STEP_PER_THREAD;
-const device T* xk[2];
-xk[0] = x + token * K_SIZE + int(simd_lid) * VALUES_PER_THREAD;
-int paired_token = paired_route >= 0 ? paired_route / TOP_K : token;
-xk[1] = x + paired_token * K_SIZE +
-    int(simd_lid) * VALUES_PER_THREAD;
+const device T* xk[MAX_PAIR];
+for (int pair = 0; pair < pair_count; ++pair) {
+  int paired_token = paired_routes[pair] / TOP_K;
+  xk[pair] = x + paired_token * K_SIZE +
+      int(simd_lid) * VALUES_PER_THREAD;
+}
 
-float up_result[2][RESULTS_PER_SIMDGROUP] = {0.0f};
-float gate_result[2][RESULTS_PER_SIMDGROUP] = {0.0f};
-float x_thread[2][VALUES_PER_THREAD];
+float up_result[MAX_PAIR][RESULTS_PER_SIMDGROUP] = {0.0f};
+float gate_result[MAX_PAIR][RESULTS_PER_SIMDGROUP] = {0.0f};
+float x_thread[MAX_PAIR][VALUES_PER_THREAD];
 
 for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
   float sums[2];
@@ -599,8 +649,7 @@ for (int k = 0; k < K_SIZE; k += BLOCK_SIZE) {
   gate_ws += BLOCK_SIZE * 5 / 8;
   gate_sc += BLOCK_SIZE / GROUP_SIZE;
   gate_bs += BLOCK_SIZE / GROUP_SIZE;
-  xk[0] += BLOCK_SIZE;
-  xk[1] += BLOCK_SIZE;
+  for (int pair = 0; pair < pair_count; ++pair) xk[pair] += BLOCK_SIZE;
 }
 
 for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
@@ -609,7 +658,7 @@ for (int row = 0; row < RESULTS_PER_SIMDGROUP; ++row) {
     float up_value = simd_sum(up_result[pair][row]);
     float gate_value = simd_sum(gate_result[pair][row]);
     if (simd_lid == 0 && n < N_SIZE) {
-      int output_route = pair == 0 ? int(route) : paired_route;
+      int output_route = paired_routes[pair];
       up_y[output_route * N_SIZE + n] = T(up_value);
       gate_y[output_route * N_SIZE + n] = T(gate_value);
     }
