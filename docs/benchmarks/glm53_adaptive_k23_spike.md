@@ -94,6 +94,21 @@ choice.  Do not reintroduce shared cost state until timing assigns replay work
 to the depth that produced it (or uses device events that measure the intended
 pipeline without forcing a synchronization).
 
+## Rejected: reuse an accepted proposal cache prefix
+
+A cache-level spike tried to retain the MTP cache entries produced while
+drafting when the target accepted the complete proposal block, then replay
+only the remaining suffix.  This reduced a three-draft toy replay from four
+MTP inputs to two, but a direct baseline comparison found that the resulting
+next-round seed hidden state was not equal.
+
+Token acceptance is insufficient to make the cache entries reusable.  Draft
+proposal steps advance from the previous MTP hidden state, while committed
+replay must advance from the corresponding target-verified hidden states.
+Those inputs differ even when every proposed token matches.  Keep the current
+abort-and-replay behavior unless a future MTP architecture explicitly proves
+that its proposal and committed hidden-state paths are identical.
+
 ## Reproduction
 
 Start the server from this branch with the already-local target and sidecar:
