@@ -2,12 +2,13 @@
 
 import logging
 import os
+import time
 from functools import partial
 
 import mlx.core as mx
 
 from ..models.cache import BatchKVCache, BatchQuantizedKVCache
-from .adaptive import K23AcceptanceGate
+from .adaptive import K23AcceptanceGate, K23EvController
 from .cache_state import SpeculativeCache, iter_leaf_caches
 from .sampling import accept_greedy, accept_sampled
 
@@ -16,6 +17,14 @@ logger = logging.getLogger(__name__)
 
 def _adaptive_k23_enabled():
     return os.environ.get("MLX_VLM_MTP_ADAPTIVE_K23", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _ev_k23_enabled():
+    return os.environ.get("MLX_VLM_MTP_EV_K23", "").lower() in {
         "1",
         "true",
         "yes",
@@ -68,9 +77,19 @@ def mtp_rounds(
         for processors in logits_processors or []
         for processor in processors or []
     )
+    ev_controller = (
+        K23EvController()
+        if _ev_k23_enabled()
+        and count == 2
+        and batch == 1
+        and greedy_sampling
+        and not immediate_yield
+        else None
+    )
     adaptive = (
         K23AcceptanceGate()
-        if _adaptive_k23_enabled()
+        if ev_controller is None
+        and _adaptive_k23_enabled()
         and count == 2
         and batch == 1
         and greedy_sampling
@@ -123,9 +142,13 @@ def mtp_rounds(
             ]
             available_depth = min(count, max(budgets) - 1)
             depth = 0 if immediate_yield else available_depth
-            if adaptive is not None:
-                depth = min(adaptive.pick(), available_depth)
-            stats_before = state.stats[0].snapshot() if adaptive is not None else None
+            controller = ev_controller or adaptive
+            if controller is not None:
+                depth = min(controller.pick(), available_depth)
+            stats_before = (
+                state.stats[0].snapshot() if controller is not None else None
+            )
+            compute_started = time.perf_counter() if ev_controller is not None else None
             proposals = state.propose(depth, forward)
             if phase_observer:
                 phase_observer("draft", [proposals])
@@ -155,6 +178,11 @@ def mtp_rounds(
                     greedy=greedy_sampling,
                     compute_logprobs=compute_logprobs,
                 )
+            pre_commit_ms = (
+                (time.perf_counter() - compute_started) * 1000.0
+                if compute_started is not None
+                else 0.0
+            )
             rows = accepted.tokens
             if phase_observer:
                 phase_observer("accept", [])
@@ -177,14 +205,32 @@ def mtp_rounds(
                             emitted[row].append(token)
                             produced[row] += 1
                     if pos + 1 == width:
+                        commit_started = (
+                            time.perf_counter() if ev_controller is not None else None
+                        )
                         state.commit(emitted, forward)
-                        if adaptive is not None and stats_before is not None:
-                            stats_after = state.stats[0].snapshot()
-                            adaptive.record(
-                                depth=depth,
-                                accepted=stats_after[1] - stats_before[1],
-                                drafted=stats_after[2] - stats_before[2],
+                        if ev_controller is not None:
+                            # Materialize the replay head here so its device cost
+                            # is charged to this round, not whichever depth the
+                            # next round happens to select.  Caller time between
+                            # streamed yields is intentionally excluded.
+                            mx.eval(
+                                state.seed.token,
+                                state.seed.hidden,
+                                state.bonus,
                             )
+                        if controller is not None and stats_before is not None:
+                            stats_after = state.stats[0].snapshot()
+                            record_args = {
+                                "depth": depth,
+                                "accepted": stats_after[1] - stats_before[1],
+                                "drafted": stats_after[2] - stats_before[2],
+                            }
+                            if ev_controller is not None and commit_started is not None:
+                                record_args["wall_ms"] = pre_commit_ms + (
+                                    time.perf_counter() - commit_started
+                                ) * 1000.0
+                            controller.record(**record_args)
                         if phase_observer:
                             phase_observer(
                                 "commit", [state.seed.token, state.seed.hidden]
@@ -213,3 +259,5 @@ def mtp_rounds(
         state.abort()
         if adaptive is not None:
             logger.info("MTP adaptive K2/K3: %s", adaptive.summary())
+        if ev_controller is not None:
+            logger.info("MTP EV K2/K3: %s", ev_controller.summary())

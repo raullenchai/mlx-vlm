@@ -15,7 +15,7 @@ from mlx_vlm.speculative.cache_state import (
     SpeculativePrefill,
     iter_leaf_caches,
 )
-from mlx_vlm.speculative.adaptive import K23AcceptanceGate
+from mlx_vlm.speculative.adaptive import K23AcceptanceGate, K23EvController
 from mlx_vlm.speculative.drafters.glm5_next_mtp import Glm5NextMTPDraftModel
 from mlx_vlm.speculative.drafters.glm5_next_mtp import ModelConfig as Glm5NextMTPConfig
 from mlx_vlm.speculative.drafters.glm5_next_mtp.split import split_glm5_next_mtp
@@ -441,6 +441,79 @@ def test_k23_acceptance_gate_detects_acceptance_that_falls_late():
     assert gate.pick() == 1
     assert gate.rounds == 6
     assert gate.acceptance == pytest.approx(2 / 3)
+
+
+def test_k23_ev_controller_selects_depth_from_cost_and_conditional_acceptance():
+    fast_second = K23EvController(seed_samples=2, acceptance_alpha=1.0)
+    slow_second = K23EvController(seed_samples=2, acceptance_alpha=1.0)
+    for controller, second_accepted in (
+        (fast_second, 2),
+        (slow_second, 1),
+    ):
+        for _ in range(2):
+            controller.record(depth=1, accepted=1, drafted=1, wall_ms=10.0)
+            controller.record(
+                depth=2,
+                accepted=second_accepted,
+                drafted=2,
+                wall_ms=12.0,
+            )
+    assert fast_second.pick() == 2  # 3 tokens / 12 ms beats 2 / 10 ms.
+    assert slow_second.pick() == 1  # The second position adds no value.
+
+
+def test_k23_ev_controller_seeds_both_widths_before_comparing():
+    controller = K23EvController(seed_samples=2)
+    assert controller.pick() == 1
+    controller.record(depth=1, accepted=1, drafted=1, wall_ms=10.0)
+    assert controller.pick() == 1
+    controller.record(depth=1, accepted=1, drafted=1, wall_ms=10.0)
+    assert controller.pick() == 2
+    controller.record(depth=2, accepted=2, drafted=2, wall_ms=12.0)
+    assert controller.pick() == 2
+
+
+def test_k23_ev_controller_periodically_probes_other_width():
+    controller = K23EvController(
+        seed_samples=1, acceptance_alpha=1.0, probe_interval=3
+    )
+    controller.record(depth=1, accepted=1, drafted=1, wall_ms=10.0)
+    controller.record(depth=2, accepted=2, drafted=2, wall_ms=12.0)
+    assert [controller.pick() for _ in range(3)] == [2, 2, 1]
+
+
+def test_k23_ev_controller_generation_path_matches_ar(monkeypatch, caplog):
+    monkeypatch.setenv("MLX_VLM_MTP_EV_K23", "1")
+    target, draft = models()
+    prompt = mx.array([[1, 2, 3]])
+    caches = target.make_cache()
+    output = target(prompt, cache=caches, return_hidden=True)
+    first = mx.argmax(output.logits[:, -1], axis=-1)
+    actual = [first.item()]
+    with caplog.at_level("INFO", logger="mlx_vlm.speculative.mtp"):
+        for tokens, _ in mtp_rounds(
+            target,
+            draft,
+            caches,
+            output.hidden_states[-1],
+            prompt_tokens=prompt,
+            first_bonus=first,
+            max_tokens=12,
+            sampler=None,
+            greedy_sampling=True,
+            draft_block_size=3,
+        ):
+            actual.append(tokens[0])
+
+    cache = target.make_cache()
+    output = target(prompt, cache=cache)
+    expected = []
+    for _ in range(12):
+        token = mx.argmax(output.logits[:, -1], axis=-1)
+        expected.append(token.item())
+        output = target(token[:, None], cache=cache)
+    assert actual == expected
+    assert "MTP EV K2/K3" in caplog.text
 
 
 def _tiny_glm5_next_text_config():
