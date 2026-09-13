@@ -101,6 +101,30 @@ important product boundary: claim the measured 3.3K exact-prefix result, not
 unbounded prompt replay.  Longer checkpoints need a separately qualified
 resident-memory policy or disk tier.
 
+## Four-stream server dogfood
+
+The cache-owned server can coalesce simultaneous speculative requests into a
+multi-row batch.  Four identical warm-prefix requests, each capped at 256
+tokens, completed in 15.416 s: 66.43 aggregate tok/s versus 40.04 tok/s for a
+single request (1.66x aggregate scaling).  Every concurrent row produced the
+same reasoning/output hash.
+
+The batch trajectory was not byte-identical to the singleton trajectory at
+temperature zero.  The same prompt reproduced the boundary without MTP: AR
+reached 57.95 aggregate tok/s versus 27.43 tok/s singleton on the 128-token
+fixture, but the dynamically admitted batch produced two output hashes (three
+rows shared one and one row differed), neither guaranteed to match singleton.
+This localizes the determinism gap to GLM backbone batch-size/dynamic-admission
+numerics rather than speculative acceptance or rollback.  Treat cross-batch
+byte invariance as a separate P1; semantic output remained sound in this
+fixture, but do not advertise exact singleton/batch equality.
+
+An environment-gated spike forced every batch-one-token affine projection
+through `singleton_quantized_linear`.  It did not restore equality and reduced
+AR aggregate throughput from 57.95 to 50.07 tok/s (13.6%).  The remaining
+sources include GLM recurrent, MoE, and batch-state-transition paths; do not
+ship a global singleton-QMM fallback.
+
 ## Rejected: shared cross-request cost EWMA
 
 A follow-up reused the K1/K2 wall-time EWMA across requests while keeping
