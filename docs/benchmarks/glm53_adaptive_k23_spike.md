@@ -233,6 +233,49 @@ runs, current-path medians were 0.672-0.677 ms while fused-argmax medians were
 slower.  Do not add a GLM-specific draft-head path for this kernel on the
 current MLX/runtime combination.
 
+## Target-verifier phase profile
+
+The production-geometry benchmark's optional synchronized phase profiler
+localized the remaining speculative decode cost on the same target, sidecar,
+and 128-token greedy prompt:
+
+| Mode | Throughput | Verify | Commit | Draft | Accept |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AR | 25.95 tok/s | — | — | — | — |
+| MTP block-total 2 | 38.66 tok/s | 89.5% | 9.1% | 0.4% | 1.0% |
+| MTP block-total 3 | 36.10 tok/s | 88.5% | 6.7% | 4.0% | 0.8% |
+
+The verifier took 39.749 ms per call at two target tokens and 51.903 ms at
+three target tokens.  This makes target short-block execution, not the MTP
+head, the next material optimization target.  The profiler changes execution
+scheduling, so use its phase shares for localization and the unsynchronized
+benchmark for release throughput claims.
+
+Do not use a full Metal GPU capture on this 181.7 GB checkpoint.  Even a
+single verifier call caused Xcode's capture layer to snapshot about 21 GB of
+buffers before the workload reached the measured step.  The trace was stopped
+and deleted without touching model weights or caches.  Prefer scoped operator
+benchmarks and explicit phase timers on this model.
+
+## Rejected: legacy single-token KDA chain fusion
+
+The closed `mlx-vlm` PR #2105 reported roughly 9–10.5% decode gains before the
+shared gated-delta and current GLM short-block work landed.  Its lossless
+single-token Metal kernel was ported as an opt-in spike to the current source
+and measured again on the real 181.7 GB checkpoint:
+
+| Path | Current | Legacy KDA fusion | Delta | Token parity |
+| --- | ---: | ---: | ---: | :---: |
+| AR | 26.08 tok/s | 26.26 tok/s | +0.7% | yes |
+| MTP block-total 2 | 39.81 tok/s | 39.94 tok/s | +0.3% | yes |
+
+Both changes are inside the observed position/run noise.  A randomized
+layer-level port was also no longer bit-exact against the current eager path:
+the largest output difference was `9.16e-5` and the largest recurrent-state
+difference was `5.39e-4`.  The old headline therefore does not transfer to the
+current runtime, and its 1,100+ lines should not be revived.  Multi-token
+target verification remains the relevant KDA/MoE surface.
+
 ## Reproduction
 
 Start the server from this branch with the already-local target and sidecar:
