@@ -206,7 +206,11 @@ def mtp_rounds(
                             produced[row] += 1
                     if pos + 1 == width:
                         state.commit(emitted, forward)
-                        if controller is not None:
+                        has_next_round = any(
+                            not done and n < limit
+                            for done, n, limit in zip(stopped, produced, limits)
+                        )
+                        if controller is not None and has_next_round:
                             # The replay head feeds only the next round.  Start
                             # it before yielding the final token so device work
                             # overlaps the caller's detokenization / framing.

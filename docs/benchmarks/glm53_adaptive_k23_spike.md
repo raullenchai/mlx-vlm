@@ -78,6 +78,22 @@ The replay launch is isolated for review on
 `perf/glm53-async-mtp-replay`; unlike this adaptive policy, it has no tuned
 acceptance threshold.
 
+## Rejected: shared cross-request cost EWMA
+
+A follow-up reused the K1/K2 wall-time EWMA across requests while keeping
+acceptance request-local.  It was rejected.  The first six-task pass reached
+37.93, 38.16, 32.96, 36.27, 33.66, and 12.05 tok/s, but the second pass changed
+the exact same coding trajectory from 199 rounds / 395 drafts to 250 rounds /
+309 drafts.  Instruction throughput fell from 36.27 to 34.27 tok/s.  Outputs
+remained byte-identical, so this was a selection-stability failure rather than
+a quality failure.
+
+The lazy replay cost can cross a request/round boundary.  Persisting that
+naively attributed EWMA lets one request poison the next request's width
+choice.  Do not reintroduce shared cost state until timing assigns replay work
+to the depth that produced it (or uses device events that measure the intended
+pipeline without forcing a synchronization).
+
 ## Reproduction
 
 Start the server from this branch with the already-local target and sidecar:
