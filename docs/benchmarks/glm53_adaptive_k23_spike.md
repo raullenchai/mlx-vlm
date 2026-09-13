@@ -78,6 +78,29 @@ The replay launch is isolated for review on
 `perf/glm53-async-mtp-replay`; unlike this adaptive policy, it has no tuned
 acceptance threshold.
 
+## Exact-prefix replay dogfood
+
+The cache-owned MTP state also unlocks a much larger repeated-prompt win than
+the decode-only figures above.  With memory APC enabled, disk APC disabled,
+and two resident checkpoint entries, an English construction-contract prompt
+was submitted twice through the streaming chat server:
+
+| Prompt | Cold TTFT | Warm TTFT | Warm cached tokens | Cold / warm total |
+| --- | ---: | ---: | ---: | ---: |
+| 1,614 tokens | 20.952 s | 1.481 s | 1,613 | 21.143 / 1.677 s |
+| 3,324 tokens | 12.397 s | 0.090 s | 3,323 | 13.572 / 1.192 s |
+
+For the 3,324-token fixture, user-visible TTFT improved 137.9x and total request
+time improved 11.39x.  The complete streamed-output SHA-256 matched between
+cold and warm requests.  Server telemetry measured the warm prefill itself at
+0.035 s for the 1,614-token fixture and reported the exact cached-token counts.
+
+A 9,352-token version did not restore under the same two-entry automatic
+memory budget (`cached_tokens=0`; repeated TTFT about 32.4 s).  This is an
+important product boundary: claim the measured 3.3K exact-prefix result, not
+unbounded prompt replay.  Longer checkpoints need a separately qualified
+resident-memory policy or disk tier.
+
 ## Rejected: shared cross-request cost EWMA
 
 A follow-up reused the K1/K2 wall-time EWMA across requests while keeping
